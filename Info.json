@@ -1,0 +1,48 @@
+{
+  "name": "Linegloss",
+  "version": "0.7.0",
+  "identifier": "com.linegloss.iina",
+  "author": {
+    "name": "Linegloss",
+    "url": "https://linegloss.com"
+  },
+  "description": "Explain the subtitle you paused on, clip its audio, and save both to your Linegloss library.",
+  "ghRepo": "Linegloss/linegloss-iina",
+  "ghVersion": 1,
+  "entry": "dist/index.js",
+  "globalEntry": "dist/global.js",
+  "preferencesPage": "dist/preferences/preferences.html",
+  "preferenceDefaults": {
+    "backendApiUrl": "https://api.linegloss.com",
+    "socks5ProxyUrl": "",
+    "timeoutSeconds": 45,
+    "pluginToken": "",
+    "accountUserId": "",
+    "accountUserName": "",
+    "accountStatus": "",
+    "accountCheckCommand": "",
+    "llmMode": "hosted",
+    "llmProvider": "openai",
+    "llmEndpointUrl": "https://api.openai.com/v1/chat/completions",
+    "llmModel": "gpt-4o-mini",
+    "llmApiKey": "",
+    "llmTemperature": 0.2,
+    "paletteShortcut": "Meta+k",
+    "ffmpegPath": "",
+    "pluginDataPath": "",
+    "cloudSaveQueueStatus": "",
+    "cloudSaveQueueCommand": "",
+    "remotePreferenceBundle": "",
+    "remotePreferenceSyncStatus": "",
+    "remotePreferenceSyncCommand": ""
+  },
+  "permissions": [
+    "video-overlay",
+    "network-request",
+    "show-osd",
+    "file-system"
+  ],
+  "allowedDomains": [
+    "*"
+  ]
+}

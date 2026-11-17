@@ -1,16 +1,245 @@
 "use strict";
 (() => {
-  // src/preferences/validation.ts
-  function validateBackendUrl(value) {
-    const trimmed = value.trim().replace(/\/+$/, "");
-    if (!/^https?:\/\/[^/?#\s]+(?:\/[^?#\s]*)?$/i.test(trimmed)) {
-      throw new Error("The library server URL must start with https:// or http://.");
+  // ../../../shared/prompts/legacy.ts
+  var PROMPT_TEMPLATES = [
+    {
+      slug: "general-explanation",
+      version: 1,
+      title: "General explanation",
+      description: "Explain meaning, tone, idioms, and a natural translation.",
+      compatibilityVersion: 1,
+      systemPrompt: [
+        "You explain video subtitles for a viewer.",
+        "Answer in {{preferredLanguage}}.",
+        "Use a {{detailLevel}} level of detail.",
+        "Explain meaning, idioms, cultural references, tone, and a natural translation when useful.",
+        "Do not invent context beyond the provided subtitle and media metadata."
+      ].join(" "),
+      userInstruction: "Explain and translate the selected subtitle text for the viewer.",
+      responseContract: "markdown-v1",
+      placeholders: [
+        {
+          key: "detailLevel",
+          type: "select",
+          label: "Detail level",
+          help: "Choose how much supporting detail the explanation should include.",
+          defaultValue: "concise",
+          required: true,
+          options: [
+            { value: "concise", label: "Concise" },
+            { value: "balanced", label: "Balanced" },
+            { value: "detailed", label: "Detailed" }
+          ]
+        }
+      ]
+    },
+    {
+      slug: "vocabulary-focus",
+      version: 1,
+      title: "Vocabulary focus",
+      description: "Highlight words and phrases that may be unfamiliar at a chosen English level.",
+      compatibilityVersion: 1,
+      systemPrompt: [
+        "You are a language tutor explaining video subtitles.",
+        "Answer in {{preferredLanguage}}.",
+        "Focus on vocabulary above CEFR level {{englishLevel}}.",
+        "Pronunciation guidance is {{includePronunciation}}.",
+        "Return JSON with a sections array. Each section has kind, title, and text.",
+        "Allowed kinds are meaning, translation, vocabulary, pronunciation, tone, and note."
+      ].join(" "),
+      userInstruction: "Explain the selected subtitle with special attention to useful vocabulary.",
+      responseContract: "sections-v1",
+      placeholders: [
+        {
+          key: "englishLevel",
+          type: "select",
+          label: "English level",
+          help: "Words above this CEFR level receive more attention.",
+          defaultValue: "B1",
+          required: true,
+          options: ["A1", "A2", "B1", "B2", "C1", "C2"].map((value) => ({
+            value,
+            label: value
+          }))
+        },
+        {
+          key: "includePronunciation",
+          type: "boolean",
+          label: "Include pronunciation",
+          help: "Ask for pronunciation when it helps explain a word.",
+          defaultValue: true,
+          required: true
+        }
+      ]
     }
-    return trimmed;
+  ];
+
+  // ../../../shared/prompts/model.ts
+  var COMPILER_VERSION = 1;
+  var PERSONAL_PROMPT_LIMIT = 5;
+  var GUIDANCE_LIMIT = 6e3;
+  var PromptValidationError = class extends Error {
+  };
+  var isRecord = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+  function exactKeys(value, keys) {
+    if (Object.keys(value).some((k) => !keys.includes(k))) throw new PromptValidationError("Unknown prompt field.");
   }
-  function normalizeTimeout(value) {
-    const numeric = Number(value);
-    return Number.isFinite(numeric) ? Math.min(180, Math.max(5, numeric)) : 45;
+  function boundedText(value, name, limit, multiline = false) {
+    if (typeof value !== "string" || !value.trim() || value.length > limit || (multiline ? /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/ : /[\u0000-\u001f\u007f]/).test(value)) {
+      throw new PromptValidationError(`${name} must contain 1\u2013${limit} characters.`);
+    }
+    return value.trim();
+  }
+
+  // ../../../shared/prompts/catalog.ts
+  var BUILTIN_PROMPTS = PROMPT_TEMPLATES.map((t) => ({
+    slug: t.slug,
+    version: 2,
+    title: t.title,
+    description: t.description,
+    guidance: [t.systemPrompt.replace("Return JSON with a sections array. Each section has kind, title, and text.", "").replace("Allowed kinds are meaning, translation, vocabulary, pronunciation, tone, and note.", "").trim(), t.userInstruction].join("\n"),
+    responseContract: t.responseContract,
+    placeholders: t.placeholders
+  }));
+  var PROMPT_REVISIONS = BUILTIN_PROMPTS;
+  var builtinKey = (p) => `${p.slug}@${p.version}`;
+  function findBuiltin(slug, version) {
+    const p = PROMPT_REVISIONS.find((t) => t.slug === slug && t.version === version);
+    if (!p) throw new PromptValidationError("This prompt version is not supported. Update Linegloss.");
+    return p;
+  }
+  function readOptionValues(raw, preset, defaults = false) {
+    if (!isRecord(raw)) throw new PromptValidationError("Prompt options must be an object.");
+    if (Object.keys(raw).some((k) => !preset.placeholders.some((p) => p.key === k))) throw new PromptValidationError("Unknown prompt option.");
+    return Object.fromEntries(preset.placeholders.map((p) => {
+      var _a, _b;
+      const value = raw[p.key] === void 0 && defaults ? p.defaultValue : raw[p.key];
+      if (p.type === "boolean" ? typeof value !== "boolean" : typeof value !== "string" || p.required && !value.trim() || value.length > ((_a = p.maxLength) != null ? _a : 240) || /[\u0000-\u001f\u007f]/.test(value) || p.type === "select" && !((_b = p.options) == null ? void 0 : _b.some((o) => o.value === value))) throw new PromptValidationError(`Invalid option: ${p.key}.`);
+      return [p.key, value];
+    }));
+  }
+  function defaultPromptSettings(legacyValues = {}, slug = "general-explanation") {
+    var _a;
+    const preset = (_a = BUILTIN_PROMPTS.find((t) => t.slug === slug)) != null ? _a : BUILTIN_PROMPTS[0];
+    return {
+      selectedPrompt: { kind: "builtin", slug: preset.slug, version: preset.version },
+      personalPrompts: [],
+      builtinValues: Object.fromEntries(BUILTIN_PROMPTS.map((p) => {
+        var _a2;
+        return [builtinKey(p), readOptionValues((_a2 = legacyValues[p.slug]) != null ? _a2 : {}, p, true)];
+      }))
+    };
+  }
+
+  // ../../../shared/prompts/compile.ts
+  function validateGuidance(text, preset) {
+    const guidance = boundedText(text, "Content guidance", GUIDANCE_LIMIT, true);
+    const allowed = /* @__PURE__ */ new Set(["preferredLanguage", ...preset.placeholders.map((p) => p.key)]);
+    const remainder = guidance.replace(/\{\{([A-Za-z][A-Za-z0-9]*)\}\}/g, (token, key, offset) => {
+      if (!allowed.has(key)) throw new PromptValidationError(`Unknown variable ${token} at character ${offset + 1}.`);
+      return "";
+    });
+    if (remainder.includes("{{") || remainder.includes("}}")) throw new PromptValidationError("Malformed variable: use {{variableName}}.");
+    return guidance;
+  }
+  function resolvePrompt(settings) {
+    var _a, _b, _c, _d;
+    const ref = settings.selectedPrompt;
+    const personal = ref.kind === "personal" ? settings.personalPrompts.find((p) => p.id === ref.id && p.revision === ref.revision) : void 0;
+    if (ref.kind === "personal" && !personal) throw new PromptValidationError("The selected personal prompt is unavailable. Sync settings.");
+    const base = ref.kind === "builtin" ? { slug: ref.slug, version: ref.version } : personal.base;
+    const preset = findBuiltin(base.slug, base.version);
+    if (personal && personal.responseContract !== preset.responseContract) throw new PromptValidationError("The response contract cannot be changed.");
+    const values = readOptionValues(personal ? personal.values : settings.builtinValues[builtinKey(base)], preset);
+    const guidance = validateGuidance((_a = personal == null ? void 0 : personal.guidance) != null ? _a : preset.guidance, preset);
+    const provenance = {
+      kind: ref.kind,
+      slug: ref.kind === "builtin" ? ref.slug : null,
+      version: ref.kind === "builtin" ? ref.version : null,
+      id: (_b = personal == null ? void 0 : personal.id) != null ? _b : null,
+      revision: (_c = personal == null ? void 0 : personal.revision) != null ? _c : null,
+      name: (_d = personal == null ? void 0 : personal.name) != null ? _d : preset.title,
+      base,
+      responseContract: preset.responseContract,
+      compilerVersion: COMPILER_VERSION
+    };
+    return { preset, values, guidance, provenance };
+  }
+
+  // ../../../shared/prompts/state.ts
+  var uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  function readPromptRef(value) {
+    if (!isRecord(value)) throw new PromptValidationError("Select a prompt.");
+    if (value.kind === "builtin") {
+      exactKeys(value, ["kind", "slug", "version"]);
+      if (typeof value.slug !== "string" || !Number.isInteger(value.version)) throw new PromptValidationError("Invalid built-in selection.");
+      findBuiltin(value.slug, value.version);
+      return { kind: "builtin", slug: value.slug, version: value.version };
+    }
+    exactKeys(value, ["kind", "id", "revision"]);
+    if (value.kind !== "personal" || typeof value.id !== "string" || !Number.isInteger(value.revision) || value.revision < 0) throw new PromptValidationError("Invalid personal selection.");
+    return { kind: "personal", id: value.id, revision: value.revision };
+  }
+  function readBase(raw) {
+    if (!isRecord(raw)) throw new PromptValidationError("A built-in base is required.");
+    exactKeys(raw, ["slug", "version"]);
+    if (typeof raw.slug !== "string" || !Number.isInteger(raw.version)) throw new PromptValidationError("Invalid base version.");
+    const preset = findBuiltin(raw.slug, raw.version);
+    return { base: { slug: preset.slug, version: preset.version }, preset };
+  }
+  function readBuiltins(raw) {
+    if (!isRecord(raw)) throw new PromptValidationError("Built-in options are required.");
+    const result = Object.fromEntries(Object.entries(raw).map(([key, value]) => {
+      const separator = key.lastIndexOf("@");
+      const preset = findBuiltin(key.slice(0, separator), Number(key.slice(separator + 1)));
+      if (builtinKey(preset) !== key) throw new PromptValidationError("Invalid built-in options key.");
+      return [key, readOptionValues(value, preset)];
+    }));
+    if (BUILTIN_PROMPTS.some((p) => !result[builtinKey(p)])) throw new PromptValidationError("Missing built-in options.");
+    return result;
+  }
+  function readPromptSettings(raw) {
+    if (!isRecord(raw) || !Array.isArray(raw.personalPrompts) || raw.personalPrompts.length > PERSONAL_PROMPT_LIMIT) throw new PromptValidationError("Invalid prompt bundle.");
+    exactKeys(raw, ["selectedPrompt", "builtinValues", "personalPrompts"]);
+    const seen = /* @__PURE__ */ new Set();
+    const personalPrompts = raw.personalPrompts.map((p) => {
+      if (!isRecord(p)) throw new PromptValidationError("Invalid personal prompt.");
+      exactKeys(p, ["id", "revision", "name", "guidance", "base", "values", "responseContract"]);
+      if (typeof p.id !== "string" || !uuid.test(p.id) || seen.has(p.id) || !Number.isSafeInteger(p.revision) || p.revision < 1) throw new PromptValidationError("Invalid prompt identity.");
+      seen.add(p.id);
+      const { base, preset } = readBase(p.base);
+      if (p.responseContract !== preset.responseContract) throw new PromptValidationError("Invalid prompt contract.");
+      return {
+        id: p.id,
+        revision: p.revision,
+        name: boundedText(p.name, "Prompt name", 80),
+        guidance: validateGuidance(p.guidance, preset),
+        base,
+        values: readOptionValues(p.values, preset),
+        responseContract: preset.responseContract
+      };
+    });
+    const result = { selectedPrompt: readPromptRef(raw.selectedPrompt), builtinValues: readBuiltins(raw.builtinValues), personalPrompts };
+    resolvePrompt(result);
+    return result;
+  }
+  function readProvenance(raw) {
+    if (!isRecord(raw)) throw new PromptValidationError("Invalid prompt provenance.");
+    exactKeys(raw, ["kind", "slug", "version", "id", "revision", "name", "base", "responseContract", "compilerVersion"]);
+    const { base, preset } = readBase(raw.base);
+    if (raw.compilerVersion !== COMPILER_VERSION || raw.responseContract !== preset.responseContract) throw new PromptValidationError("Unsupported prompt provenance.");
+    if (raw.kind === "builtin" ? raw.slug !== base.slug || raw.version !== base.version || raw.id !== null || raw.revision !== null : raw.kind !== "personal" || raw.slug !== null || raw.version !== null || typeof raw.id !== "string" || !uuid.test(raw.id) || !Number.isSafeInteger(raw.revision) || raw.revision < 1) throw new PromptValidationError("Invalid prompt provenance identity.");
+    return {
+      kind: raw.kind === "builtin" ? "builtin" : "personal",
+      slug: raw.kind === "builtin" ? base.slug : null,
+      version: raw.kind === "builtin" ? base.version : null,
+      id: raw.kind === "personal" ? raw.id : null,
+      revision: raw.kind === "personal" ? raw.revision : null,
+      name: boundedText(raw.name, "Prompt name", 120),
+      base,
+      responseContract: preset.responseContract,
+      compilerVersion: COMPILER_VERSION
+    };
   }
 
   // src/shared/encoding.ts
@@ -38,8 +267,204 @@
       return null;
     }
   }
-  function isRecord(value) {
+  function isRecord2(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+
+  // src/preferences/remote.ts
+  var TEMPLATE_SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+  var DEFAULT_PROMPT_TEMPLATE = PROMPT_TEMPLATES[0];
+  var DEFAULT_HOSTED_MODEL = { id: "mistral-small-2603", label: "Mistral Small 4" };
+  var DEFAULT_REMOTE_PREFERENCE_BUNDLE = {
+    version: "bundled-default",
+    schemaVersion: 2,
+    compilerVersion: COMPILER_VERSION,
+    prompts: defaultPromptSettings(),
+    catalogVersion: 4,
+    preferences: {
+      schemaVersion: 1,
+      preferredLanguage: "English",
+      temperature: 0.2,
+      selectedTemplateSlug: DEFAULT_PROMPT_TEMPLATE.slug,
+      clipAudioByDefault: false,
+      hostedMaxOutputTokens: 1024
+    },
+    templateValues: Object.fromEntries(PROMPT_TEMPLATES.map((t) => [t.slug, Object.fromEntries(t.placeholders.map((p) => [p.key, p.defaultValue]))])),
+    templates: PROMPT_TEMPLATES,
+    hostedModel: DEFAULT_HOSTED_MODEL,
+    updatedAt: null
+  };
+  function parseRemotePreferenceBundle(value) {
+    return validateRemotePreferenceBundle(decodePreferenceJson(value, true));
+  }
+  function validateRemotePreferenceBundle(value) {
+    var _a;
+    if (!isRecord2(value)) return null;
+    let prompts;
+    if (value.schemaVersion !== void 0) {
+      if (value.schemaVersion !== 2 || value.compilerVersion !== COMPILER_VERSION) return null;
+      try {
+        prompts = readPromptSettings(value.prompts);
+      } catch (e) {
+        return null;
+      }
+    }
+    const preferences = readPreferences(value.preferences);
+    const legacyTemplateValues = isRecord2(value.preferences) ? value.preferences.templateValues : void 0;
+    const templateValues = readTemplateValues((_a = value.templateValues) != null ? _a : legacyTemplateValues);
+    const templates = readTemplates(value.templates);
+    const hostedModel = readHostedModel(value.hostedModel);
+    if (typeof value.version !== "string" || value.version.length < 1 || value.version.length > 160 || typeof value.catalogVersion !== "number" || !Number.isInteger(value.catalogVersion) || value.catalogVersion < 1 || !hostedModel || !preferences || !templateValues || !templates || !templates.some((template) => template.slug === preferences.selectedTemplateSlug) || !validateTemplateValues(templateValues, templates) || value.updatedAt !== null && typeof value.updatedAt !== "string") return null;
+    return {
+      ...prompts ? { schemaVersion: 2, compilerVersion: COMPILER_VERSION, prompts } : {},
+      version: value.version,
+      catalogVersion: value.catalogVersion,
+      preferences,
+      templateValues,
+      templates,
+      hostedModel,
+      updatedAt: value.updatedAt
+    };
+  }
+  function serializeRemotePreferenceBundle(bundle) {
+    return encodePreferenceJson(bundle);
+  }
+  function serializeRemoteSyncStatus(status) {
+    return encodePreferenceJson(status);
+  }
+  function readPreferences(value) {
+    if (!isRecord2(value)) return null;
+    if (value.schemaVersion !== 1 || typeof value.preferredLanguage !== "string" || !value.preferredLanguage.trim() || value.preferredLanguage.length > 80 || typeof value.temperature !== "number" || value.temperature < 0 || value.temperature > 2 || typeof value.selectedTemplateSlug !== "string" || !TEMPLATE_SLUG.test(value.selectedTemplateSlug)) return null;
+    const defaults = DEFAULT_REMOTE_PREFERENCE_BUNDLE.preferences;
+    const maxTokens = value.hostedMaxOutputTokens;
+    return {
+      schemaVersion: 1,
+      preferredLanguage: value.preferredLanguage,
+      temperature: value.temperature,
+      selectedTemplateSlug: value.selectedTemplateSlug,
+      clipAudioByDefault: typeof value.clipAudioByDefault === "boolean" ? value.clipAudioByDefault : false,
+      hostedMaxOutputTokens: typeof maxTokens === "number" && Number.isInteger(maxTokens) && maxTokens >= 256 && maxTokens <= 4096 ? maxTokens : defaults.hostedMaxOutputTokens
+    };
+  }
+  function readHostedModel(value) {
+    if (!isRecord2(value) || typeof value.id !== "string" || !/^[a-z0-9][a-z0-9.-]{0,159}$/.test(value.id) || typeof value.label !== "string" || !value.label.trim() || value.label.length > 80 || /[\u0000-\u001f\u007f]/.test(value.label)) return null;
+    return { id: value.id, label: value.label };
+  }
+  function readTemplateValues(value) {
+    if (!isRecord2(value)) return null;
+    const templateValues = {};
+    for (const [slug, rawValues] of Object.entries(value)) {
+      if (!TEMPLATE_SLUG.test(slug) || !isRecord2(rawValues)) return null;
+      const values = {};
+      for (const [key, rawValue] of Object.entries(rawValues)) {
+        if (!/^[A-Za-z][A-Za-z0-9]*$/.test(key) || typeof rawValue !== "string" && typeof rawValue !== "boolean") return null;
+        if (typeof rawValue === "string" && rawValue.length > 240) return null;
+        values[key] = rawValue;
+      }
+      templateValues[slug] = values;
+    }
+    return templateValues;
+  }
+  function readTemplates(value) {
+    if (!Array.isArray(value) || value.length < 1 || value.length > 50) return null;
+    const templates = [];
+    const slugs = /* @__PURE__ */ new Set();
+    for (const candidate of value) {
+      if (!isRecord2(candidate) || typeof candidate.slug !== "string" || !TEMPLATE_SLUG.test(candidate.slug) || slugs.has(candidate.slug)) return null;
+      if (typeof candidate.version !== "number" || !Number.isInteger(candidate.version) || candidate.version < 1 || candidate.compatibilityVersion !== 1 || typeof candidate.title !== "string" || candidate.title.length > 120 || typeof candidate.description !== "string" || candidate.description.length > 500 || typeof candidate.systemPrompt !== "string" || candidate.systemPrompt.length > 2e4 || typeof candidate.userInstruction !== "string" || candidate.userInstruction.length > 1e4 || candidate.responseContract !== "markdown-v1" && candidate.responseContract !== "sections-v1" || !Array.isArray(candidate.placeholders) || candidate.placeholders.length > 20) return null;
+      const placeholders = candidate.placeholders.map(readPlaceholder);
+      if (placeholders.some((placeholder) => !placeholder)) return null;
+      const placeholderKeys = new Set(placeholders.map((placeholder) => placeholder == null ? void 0 : placeholder.key));
+      if (placeholderKeys.size !== placeholders.length) return null;
+      slugs.add(candidate.slug);
+      templates.push({
+        slug: candidate.slug,
+        version: candidate.version,
+        title: candidate.title,
+        description: candidate.description,
+        compatibilityVersion: 1,
+        systemPrompt: candidate.systemPrompt,
+        userInstruction: candidate.userInstruction,
+        responseContract: candidate.responseContract,
+        placeholders
+      });
+    }
+    return templates;
+  }
+  function readPlaceholder(value) {
+    if (!isRecord2(value) || typeof value.key !== "string" || !/^[A-Za-z][A-Za-z0-9]*$/.test(value.key)) return null;
+    if (value.type !== "select" && value.type !== "boolean" && value.type !== "short-text") return null;
+    if (typeof value.label !== "string" || typeof value.help !== "string" || typeof value.required !== "boolean") return null;
+    if (typeof value.defaultValue !== "string" && typeof value.defaultValue !== "boolean") return null;
+    if (value.type === "boolean" && typeof value.defaultValue !== "boolean") return null;
+    if (value.type !== "boolean" && typeof value.defaultValue !== "string") return null;
+    let options;
+    if (value.options !== void 0) {
+      if (!Array.isArray(value.options) || value.options.length > 50) return null;
+      options = [];
+      for (const option of value.options) {
+        if (!isRecord2(option) || typeof option.value !== "string" || !option.value || typeof option.label !== "string" || !option.label) return null;
+        options.push({ value: option.value, label: option.label });
+      }
+    }
+    if (options && new Set(options.map((option) => option.value)).size !== options.length) return null;
+    if (value.type === "select" && (!options || options.length < 1 || !options.some((option) => option.value === value.defaultValue))) return null;
+    let maxLength;
+    if (value.maxLength !== void 0) {
+      if (typeof value.maxLength !== "number" || !Number.isInteger(value.maxLength) || value.maxLength < 1 || value.maxLength > 240) return null;
+      maxLength = value.maxLength;
+    }
+    if (value.type === "short-text") {
+      const defaultValue = value.defaultValue;
+      if (value.required && !defaultValue.trim() || defaultValue.length > (maxLength != null ? maxLength : 120)) return null;
+    }
+    return {
+      key: value.key,
+      type: value.type,
+      label: value.label.slice(0, 120),
+      help: value.help.slice(0, 500),
+      defaultValue: value.defaultValue,
+      required: value.required,
+      maxLength,
+      options
+    };
+  }
+  function validateTemplateValues(templateValues, templates) {
+    var _a, _b;
+    const templatesBySlug = new Map(templates.map((template) => [template.slug, template]));
+    for (const slug of Object.keys(templateValues)) {
+      if (!templatesBySlug.has(slug)) return false;
+    }
+    for (const template of templates) {
+      const values = templateValues[template.slug];
+      if (!values) return false;
+      const placeholdersByKey = new Map(template.placeholders.map((placeholder) => [placeholder.key, placeholder]));
+      if (Object.keys(values).some((key) => !placeholdersByKey.has(key))) return false;
+      for (const placeholder of template.placeholders) {
+        const value = values[placeholder.key];
+        if (placeholder.type === "boolean") {
+          if (typeof value !== "boolean") return false;
+          continue;
+        }
+        if (typeof value !== "string") return false;
+        if (placeholder.required && !value.trim() || value.length > ((_a = placeholder.maxLength) != null ? _a : 240)) return false;
+        if (placeholder.type === "select" && !((_b = placeholder.options) == null ? void 0 : _b.some((option) => option.value === value))) return false;
+      }
+    }
+    return true;
+  }
+
+  // src/preferences/validation.ts
+  function validateBackendUrl(value) {
+    const trimmed = value.trim().replace(/\/+$/, "");
+    if (!/^https?:\/\/[^/?#\s]+(?:\/[^?#\s]*)?$/i.test(trimmed)) {
+      throw new Error("The library server URL must start with https:// or http://.");
+    }
+    return trimmed;
+  }
+  function normalizeTimeout(value) {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? Math.min(180, Math.max(5, numeric)) : 45;
   }
 
   // src/llm/response.ts
@@ -65,7 +490,7 @@
   var SIGNED_OUT_STATUS = {
     state: "signed-out",
     message: "Paste a plugin token from linegloss.com to connect.",
-    userName: "",
+    email: "",
     expiresAt: null,
     checkedAt: null
   };
@@ -125,13 +550,13 @@
         this.writeStatus({
           state: "invalid",
           message: "This doesn't look like a plugin token. Copy the whole token that starts with lgp_.",
-          userName: "",
+          email: "",
           expiresAt: null
         });
         return;
       }
       if (announce) {
-        this.writeStatus({ state: "checking", message: "Checking your plugin token\u2026", userName: "", expiresAt: null });
+        this.writeStatus({ state: "checking", message: "Checking your plugin token\u2026", email: "", expiresAt: null });
       }
       let response;
       try {
@@ -151,6 +576,7 @@
         this.unreachable(error instanceof Error ? error.message : String(error));
         return;
       }
+      if (readString(this.preferences.get("pluginToken")) !== token || readString(this.preferences.get("backendApiUrl")) !== backend) return;
       const body = readBody(response);
       if (response.statusCode === 401) {
         this.clearIdentity();
@@ -158,16 +584,16 @@
         this.writeStatus({
           state: "invalid",
           message: "This token is invalid, expired, or revoked. Create a new one on linegloss.com.",
-          userName: "",
+          email: "",
           expiresAt: null
         });
         return;
       }
-      const data = isRecord(body.data) ? body.data : null;
-      const user = data && isRecord(data.user) ? data.user : null;
-      const session = data && isRecord(data.session) ? data.session : null;
+      const data = isRecord2(body.data) ? body.data : null;
+      const user = data && isRecord2(data.user) ? data.user : null;
+      const session = data && isRecord2(data.session) ? data.session : null;
       const userId = user ? readString(user.id) : "";
-      const userName = user ? readString(user.userName) : "";
+      const email = user ? readString(user.email) : "";
       if (response.statusCode < 200 || response.statusCode >= 300 || !userId) {
         this.unreachable(`The library answered with an error (${response.statusCode}).`);
         return;
@@ -178,18 +604,19 @@
         this.writeStatus({
           state: "invalid",
           message: "That is a website session, not a plugin token. Create a plugin token in Settings on linegloss.com.",
-          userName: "",
+          email: "",
           expiresAt: null
         });
         return;
       }
+      if (readString(this.preferences.get("accountUserId")) && readString(this.preferences.get("accountUserId")) !== userId) this.preferences.set("remotePreferenceBundle", serializeRemotePreferenceBundle(DEFAULT_REMOTE_PREFERENCE_BUNDLE));
       this.preferences.set("accountUserId", userId);
-      this.preferences.set("accountUserName", userName);
+      this.preferences.set("accountEmail", email);
       this.nextCheckAt = this.now() + RECHECK_INTERVAL_MS;
       this.writeStatus({
         state: "connected",
-        message: `Connected as ${userName || "your account"}.`,
-        userName,
+        message: `Connected as ${email || "your account"}.`,
+        email,
         expiresAt: session && typeof session.expiresAt === "string" ? session.expiresAt : null
       });
     }
@@ -198,7 +625,7 @@
       this.writeStatus({
         state: "unreachable",
         message: `Couldn't reach the library: ${reason.slice(0, 160)}`,
-        userName: readString(this.preferences.get("accountUserName")),
+        email: readString(this.preferences.get("accountEmail")),
         expiresAt: null
       });
     }
@@ -207,8 +634,9 @@
       this.writeStatus({ ...SIGNED_OUT_STATUS });
     }
     clearIdentity() {
+      this.preferences.set("remotePreferenceBundle", serializeRemotePreferenceBundle(DEFAULT_REMOTE_PREFERENCE_BUNDLE));
       this.preferences.set("accountUserId", "");
-      this.preferences.set("accountUserName", "");
+      this.preferences.set("accountEmail", "");
     }
     writeStatus(status) {
       this.preferences.set(ACCOUNT_STATUS_KEY, serializeAccountStatus({ ...status, checkedAt: this.now() }));
@@ -221,10 +649,10 @@
     }
   };
   function readBody(response) {
-    if (isRecord(response.data)) return response.data;
+    if (isRecord2(response.data)) return response.data;
     try {
       const parsed = response.text ? JSON.parse(response.text) : {};
-      return isRecord(parsed) ? parsed : {};
+      return isRecord2(parsed) ? parsed : {};
     } catch (_error) {
       return {};
     }
@@ -315,8 +743,8 @@
     }
     request(method, url, options, proxyUrl, timeoutSeconds) {
       const validatedProxy = validateSocks5Proxy(proxyUrl);
-      if (!validatedProxy) {
-        return method === "GET" ? this.http.get(url, options) : this.http.post(url, options);
+      if (!validatedProxy && method === "GET") {
+        return this.http.get(url, options);
       }
       return this.requestWithCurl(method, url, options, validatedProxy, timeoutSeconds);
     }
@@ -340,7 +768,7 @@
       lines.push(`write-out = ${quoteCurlConfig(`\\n${STATUS_MARKER}%{http_code}`)}`);
       const result = await executeCurlWithProtectedConfig(this.file, this.utils, "http", lines);
       if (result.status !== 0) {
-        throw new Error(`Proxied request transport failed (curl status ${result.status}).`);
+        throw new Error(`HTTP request transport failed (curl status ${result.status}).`);
       }
       return parseCurlResponse(result.stdout);
     }
@@ -357,13 +785,13 @@
 ${STATUS_MARKER}`;
     const markerIndex = stdout.lastIndexOf(marker);
     if (markerIndex < 0) {
-      throw new Error("Proxied request returned an unreadable response.");
+      throw new Error("HTTP request returned an unreadable response.");
     }
     const text = stdout.slice(0, markerIndex);
     const rawStatus = stdout.slice(markerIndex + marker.length).trim();
     const statusCode = Number(rawStatus);
     if (!Number.isInteger(statusCode) || statusCode < 100 || statusCode > 599) {
-      throw new Error("Proxied request returned an invalid HTTP status.");
+      throw new Error("HTTP request returned an invalid HTTP status.");
     }
     let data = null;
     if (text) {
@@ -394,215 +822,6 @@ ${STATUS_MARKER}`;
     return "HTTP response";
   }
 
-  // src/preferences/remote.ts
-  var TEMPLATE_SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-  var DEFAULT_PROMPT_TEMPLATE = {
-    slug: "general-explanation",
-    version: 1,
-    title: "General explanation",
-    description: "Explain meaning, tone, idioms, and a natural translation.",
-    compatibilityVersion: 1,
-    systemPrompt: [
-      "You explain video subtitles for a viewer.",
-      "Answer in {{preferredLanguage}}.",
-      "Use a {{detailLevel}} level of detail.",
-      "Explain meaning, idioms, cultural references, tone, and a natural translation when useful.",
-      "Do not invent context beyond the provided subtitle and media metadata."
-    ].join(" "),
-    userInstruction: "Explain and translate the selected subtitle text for the viewer.",
-    responseContract: "markdown-v1",
-    placeholders: [{
-      key: "detailLevel",
-      type: "select",
-      label: "Detail level",
-      help: "Choose how much supporting detail the explanation should include.",
-      defaultValue: "concise",
-      required: true,
-      options: [
-        { value: "concise", label: "Concise" },
-        { value: "balanced", label: "Balanced" },
-        { value: "detailed", label: "Detailed" }
-      ]
-    }]
-  };
-  var DEFAULT_HOSTED_MODEL = { id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", label: "Llama 3.3 70B" };
-  var DEFAULT_REMOTE_PREFERENCE_BUNDLE = {
-    version: "bundled-default",
-    catalogVersion: 1,
-    preferences: {
-      schemaVersion: 1,
-      preferredLanguage: "English",
-      temperature: 0.2,
-      selectedTemplateSlug: DEFAULT_PROMPT_TEMPLATE.slug,
-      clipAudioByDefault: false,
-      hostedModel: DEFAULT_HOSTED_MODEL.id,
-      hostedMaxOutputTokens: 1024
-    },
-    templateValues: { [DEFAULT_PROMPT_TEMPLATE.slug]: { detailLevel: "concise" } },
-    templates: [DEFAULT_PROMPT_TEMPLATE],
-    hostedModels: [DEFAULT_HOSTED_MODEL],
-    updatedAt: null
-  };
-  function parseRemotePreferenceBundle(value) {
-    return validateRemotePreferenceBundle(decodePreferenceJson(value, true));
-  }
-  function validateRemotePreferenceBundle(value) {
-    var _a;
-    if (!isRecord(value)) return null;
-    const preferences = readPreferences(value.preferences);
-    const legacyTemplateValues = isRecord(value.preferences) ? value.preferences.templateValues : void 0;
-    const templateValues = readTemplateValues((_a = value.templateValues) != null ? _a : legacyTemplateValues);
-    const templates = readTemplates(value.templates);
-    const hostedModels = readHostedModels(value.hostedModels);
-    if (typeof value.version !== "string" || value.version.length < 1 || value.version.length > 160 || typeof value.catalogVersion !== "number" || !Number.isInteger(value.catalogVersion) || value.catalogVersion < 1 || !preferences || !templateValues || !templates || !templates.some((template) => template.slug === preferences.selectedTemplateSlug) || !validateTemplateValues(templateValues, templates) || value.updatedAt !== null && typeof value.updatedAt !== "string") return null;
-    return {
-      version: value.version,
-      catalogVersion: value.catalogVersion,
-      preferences,
-      templateValues,
-      templates,
-      hostedModels,
-      updatedAt: value.updatedAt
-    };
-  }
-  function serializeRemotePreferenceBundle(bundle) {
-    return encodePreferenceJson(bundle);
-  }
-  function serializeRemoteSyncStatus(status) {
-    return encodePreferenceJson(status);
-  }
-  function readPreferences(value) {
-    if (!isRecord(value)) return null;
-    if (value.schemaVersion !== 1 || typeof value.preferredLanguage !== "string" || !value.preferredLanguage.trim() || value.preferredLanguage.length > 80 || typeof value.temperature !== "number" || value.temperature < 0 || value.temperature > 2 || typeof value.selectedTemplateSlug !== "string" || !TEMPLATE_SLUG.test(value.selectedTemplateSlug)) return null;
-    const defaults = DEFAULT_REMOTE_PREFERENCE_BUNDLE.preferences;
-    const maxTokens = value.hostedMaxOutputTokens;
-    return {
-      schemaVersion: 1,
-      preferredLanguage: value.preferredLanguage,
-      temperature: value.temperature,
-      selectedTemplateSlug: value.selectedTemplateSlug,
-      clipAudioByDefault: typeof value.clipAudioByDefault === "boolean" ? value.clipAudioByDefault : false,
-      // Bundles from a Worker before 0.7.0 have no hosted fields; the hosted endpoint applies its own defaults.
-      hostedModel: typeof value.hostedModel === "string" && /^@cf\/[\w.-]+\/[\w.-]+$/.test(value.hostedModel) ? value.hostedModel : defaults.hostedModel,
-      hostedMaxOutputTokens: typeof maxTokens === "number" && Number.isInteger(maxTokens) && maxTokens >= 256 && maxTokens <= 4096 ? maxTokens : defaults.hostedMaxOutputTokens
-    };
-  }
-  function readHostedModels(value) {
-    const models = [];
-    if (Array.isArray(value)) {
-      for (const candidate of value.slice(0, 20)) {
-        if (!isRecord(candidate) || typeof candidate.id !== "string" || typeof candidate.label !== "string") continue;
-        if (!candidate.id || candidate.id.length > 160 || !candidate.label || models.some((model) => model.id === candidate.id)) continue;
-        models.push({ id: candidate.id, label: candidate.label.slice(0, 80) });
-      }
-    }
-    if (models.length === 0) models.push(DEFAULT_HOSTED_MODEL);
-    return models;
-  }
-  function readTemplateValues(value) {
-    if (!isRecord(value)) return null;
-    const templateValues = {};
-    for (const [slug, rawValues] of Object.entries(value)) {
-      if (!TEMPLATE_SLUG.test(slug) || !isRecord(rawValues)) return null;
-      const values = {};
-      for (const [key, rawValue] of Object.entries(rawValues)) {
-        if (!/^[A-Za-z][A-Za-z0-9]*$/.test(key) || typeof rawValue !== "string" && typeof rawValue !== "boolean") return null;
-        if (typeof rawValue === "string" && rawValue.length > 240) return null;
-        values[key] = rawValue;
-      }
-      templateValues[slug] = values;
-    }
-    return templateValues;
-  }
-  function readTemplates(value) {
-    if (!Array.isArray(value) || value.length < 1 || value.length > 50) return null;
-    const templates = [];
-    const slugs = /* @__PURE__ */ new Set();
-    for (const candidate of value) {
-      if (!isRecord(candidate) || typeof candidate.slug !== "string" || !TEMPLATE_SLUG.test(candidate.slug) || slugs.has(candidate.slug)) return null;
-      if (typeof candidate.version !== "number" || !Number.isInteger(candidate.version) || candidate.version < 1 || candidate.compatibilityVersion !== 1 || typeof candidate.title !== "string" || candidate.title.length > 120 || typeof candidate.description !== "string" || candidate.description.length > 500 || typeof candidate.systemPrompt !== "string" || candidate.systemPrompt.length > 2e4 || typeof candidate.userInstruction !== "string" || candidate.userInstruction.length > 1e4 || candidate.responseContract !== "markdown-v1" && candidate.responseContract !== "sections-v1" || !Array.isArray(candidate.placeholders) || candidate.placeholders.length > 20) return null;
-      const placeholders = candidate.placeholders.map(readPlaceholder);
-      if (placeholders.some((placeholder) => !placeholder)) return null;
-      const placeholderKeys = new Set(placeholders.map((placeholder) => placeholder == null ? void 0 : placeholder.key));
-      if (placeholderKeys.size !== placeholders.length) return null;
-      slugs.add(candidate.slug);
-      templates.push({
-        slug: candidate.slug,
-        version: candidate.version,
-        title: candidate.title,
-        description: candidate.description,
-        compatibilityVersion: 1,
-        systemPrompt: candidate.systemPrompt,
-        userInstruction: candidate.userInstruction,
-        responseContract: candidate.responseContract,
-        placeholders
-      });
-    }
-    return templates;
-  }
-  function readPlaceholder(value) {
-    if (!isRecord(value) || typeof value.key !== "string" || !/^[A-Za-z][A-Za-z0-9]*$/.test(value.key)) return null;
-    if (value.type !== "select" && value.type !== "boolean" && value.type !== "short-text") return null;
-    if (typeof value.label !== "string" || typeof value.help !== "string" || typeof value.required !== "boolean") return null;
-    if (typeof value.defaultValue !== "string" && typeof value.defaultValue !== "boolean") return null;
-    if (value.type === "boolean" && typeof value.defaultValue !== "boolean") return null;
-    if (value.type !== "boolean" && typeof value.defaultValue !== "string") return null;
-    let options;
-    if (value.options !== void 0) {
-      if (!Array.isArray(value.options) || value.options.length > 50) return null;
-      options = [];
-      for (const option of value.options) {
-        if (!isRecord(option) || typeof option.value !== "string" || !option.value || typeof option.label !== "string" || !option.label) return null;
-        options.push({ value: option.value, label: option.label });
-      }
-    }
-    if (options && new Set(options.map((option) => option.value)).size !== options.length) return null;
-    if (value.type === "select" && (!options || options.length < 1 || !options.some((option) => option.value === value.defaultValue))) return null;
-    let maxLength;
-    if (value.maxLength !== void 0) {
-      if (typeof value.maxLength !== "number" || !Number.isInteger(value.maxLength) || value.maxLength < 1 || value.maxLength > 240) return null;
-      maxLength = value.maxLength;
-    }
-    if (value.type === "short-text") {
-      const defaultValue = value.defaultValue;
-      if (value.required && !defaultValue.trim() || defaultValue.length > (maxLength != null ? maxLength : 120)) return null;
-    }
-    return {
-      key: value.key,
-      type: value.type,
-      label: value.label.slice(0, 120),
-      help: value.help.slice(0, 500),
-      defaultValue: value.defaultValue,
-      required: value.required,
-      maxLength,
-      options
-    };
-  }
-  function validateTemplateValues(templateValues, templates) {
-    var _a, _b;
-    const templatesBySlug = new Map(templates.map((template) => [template.slug, template]));
-    for (const slug of Object.keys(templateValues)) {
-      if (!templatesBySlug.has(slug)) return false;
-    }
-    for (const template of templates) {
-      const values = templateValues[template.slug];
-      if (!values) return false;
-      const placeholdersByKey = new Map(template.placeholders.map((placeholder) => [placeholder.key, placeholder]));
-      if (Object.keys(values).some((key) => !placeholdersByKey.has(key))) return false;
-      for (const placeholder of template.placeholders) {
-        const value = values[placeholder.key];
-        if (placeholder.type === "boolean") {
-          if (typeof value !== "boolean") return false;
-          continue;
-        }
-        if (typeof value !== "string") return false;
-        if (placeholder.required && !value.trim() || value.length > ((_a = placeholder.maxLength) != null ? _a : 240)) return false;
-        if (placeholder.type === "select" && !((_b = placeholder.options) == null ? void 0 : _b.some((option) => option.value === value))) return false;
-      }
-    }
-    return true;
-  }
-
   // src/preferences/syncRuntime.ts
   var POLL_INTERVAL_MS2 = 1e3;
   var REFRESH_INTERVAL_MS = 5 * 6e4;
@@ -614,7 +833,8 @@ ${STATUS_MARKER}`;
       this.preferences = preferences;
       this.http = http2;
       this.running = false;
-      this.lastToken = "";
+      this.lastToken = null;
+      this.lastBackend = "";
       this.lastCommand = "";
       this.nextRefreshAt = 0;
       var _a, _b;
@@ -629,13 +849,20 @@ ${STATUS_MARKER}`;
       if (this.running) return;
       const token = readString2(this.preferences.get("pluginToken"));
       const command = readString2(this.preferences.get(COMMAND_KEY));
-      const tokenChanged = token !== this.lastToken;
+      const backend = readString2(this.preferences.get("backendApiUrl"));
+      const tokenChanged = token !== this.lastToken || backend !== this.lastBackend;
+      if (this.lastToken !== null && tokenChanged) {
+        this.preferences.set(BUNDLE_KEY, serializeRemotePreferenceBundle(DEFAULT_REMOTE_PREFERENCE_BUNDLE));
+        this.preferences.sync();
+      }
+      this.lastBackend = backend;
       const commandChanged = Boolean(command && command !== this.lastCommand);
       this.lastToken = token;
       if (commandChanged) this.lastCommand = command;
       if (!token) {
         if (tokenChanged || commandChanged) {
-          this.writeStatus("stale", "Connect your library to sync. The last synced settings stay in use.");
+          this.preferences.set(BUNDLE_KEY, serializeRemotePreferenceBundle(DEFAULT_REMOTE_PREFERENCE_BUNDLE));
+          this.writeStatus("stale", "Connect your library to sync. Personal prompts have been cleared from this Mac.");
         }
         return;
       }
@@ -650,10 +877,11 @@ ${STATUS_MARKER}`;
         const headers = { Authorization: `Bearer ${token}` };
         if (cached == null ? void 0 : cached.version) headers["If-None-Match"] = cached.version;
         const response = await withTimeout(
-          this.http.get(`${backendApiUrl}/api/preferences`, { headers, params: {}, data: {} }, proxyUrl, timeoutSeconds),
+          this.http.get(`${backendApiUrl}/api/preferences?schemaVersion=2`, { headers, params: {}, data: {} }, proxyUrl, timeoutSeconds),
           timeoutSeconds,
           `Linegloss didn't answer within ${timeoutSeconds} seconds.`
         );
+        if (readString2(this.preferences.get("pluginToken")) !== token || readString2(this.preferences.get("backendApiUrl")) !== backend) return;
         if (response.statusCode === 304) {
           this.writeStatus("synced", "Up to date.");
         } else if (response.statusCode >= 200 && response.statusCode < 300) {
@@ -661,7 +889,7 @@ ${STATUS_MARKER}`;
           if (!body) throw new Error("Linegloss returned an unreadable response.");
           if (!("data" in body)) throw new Error("Linegloss returned an incomplete response.");
           const bundle = validateRemotePreferenceBundle(body.data);
-          if (!bundle) throw new Error("These settings need a newer version of the plugin.");
+          if (!bundle || bundle.schemaVersion !== 2) throw new Error("These settings need a newer version of the plugin.");
           this.preferences.set(BUNDLE_KEY, serializeRemotePreferenceBundle(bundle));
           this.writeStatus("synced", "Up to date.");
         } else {
@@ -765,10 +993,17 @@ ${STATUS_MARKER2}`;
 
   // src/sync/contracts.ts
   function parseCloudSaveManifest(value) {
-    if (!isRecord2(value) || value.schemaVersion !== 1 || !isRecord2(value.explanation)) return null;
+    if (!isRecord3(value) || value.schemaVersion !== 1 || !isRecord3(value.explanation)) return null;
     if (!isSafeId(value.jobId) || typeof value.createdAt !== "string" || !isHttpUrl(value.backendApiUrl) || !isSafeId(value.accountUserId) || value.step !== "pending-explanation" && value.step !== "pending-audio" && value.step !== "failed" || typeof value.explanationId !== "string" || value.explanationId.length > 80 || !isNonNegativeInteger(value.attempts) || typeof value.nextAttemptAt !== "number" || !Number.isFinite(value.nextAttemptAt) || typeof value.lastError !== "string" || value.lastError.length > 500) return null;
     const explanation = value.explanation;
-    if (!isBoundedString(explanation.subtitle, 1e4) || !isBoundedString(explanation.explanation, 5e4) || explanation.timestamp !== null && (typeof explanation.timestamp !== "number" || !Number.isFinite(explanation.timestamp) || explanation.timestamp < 0) || typeof explanation.mediaTitle !== "string" || explanation.mediaTitle.length > 512 || !isBoundedString(explanation.promptTemplateSlug, 80) || !isPositiveInteger(explanation.promptTemplateVersion) || !isBoundedString(explanation.responseContract, 80)) return null;
+    if (!isBoundedString(explanation.subtitle, 1e4) || !isBoundedString(explanation.explanation, 5e4) || explanation.timestamp !== null && (typeof explanation.timestamp !== "number" || !Number.isFinite(explanation.timestamp) || explanation.timestamp < 0) || typeof explanation.mediaTitle !== "string" || explanation.mediaTitle.length > 512 || explanation.promptTemplateSlug !== null && !isBoundedString(explanation.promptTemplateSlug, 80) || explanation.promptTemplateVersion !== null && !isPositiveInteger(explanation.promptTemplateVersion) || !isBoundedString(explanation.responseContract, 80)) return null;
+    let prompt;
+    try {
+      if (explanation.prompt !== void 0) prompt = readProvenance(explanation.prompt);
+    } catch (e) {
+      return null;
+    }
+    if (prompt ? prompt.slug !== explanation.promptTemplateSlug || prompt.version !== explanation.promptTemplateVersion || prompt.responseContract !== explanation.responseContract : !explanation.promptTemplateSlug || !explanation.promptTemplateVersion) return null;
     const audio = readAudio(value.audio);
     if (value.audio !== null && !audio) return null;
     return {
@@ -789,7 +1024,8 @@ ${STATUS_MARKER2}`;
         mediaTitle: explanation.mediaTitle,
         promptTemplateSlug: explanation.promptTemplateSlug,
         promptTemplateVersion: explanation.promptTemplateVersion,
-        responseContract: explanation.responseContract
+        responseContract: explanation.responseContract,
+        ...prompt ? { prompt } : {}
       },
       audio
     };
@@ -799,14 +1035,14 @@ ${STATUS_MARKER2}`;
   }
   function parseCloudSaveQueueCommand(value) {
     const parsed = decodePreferenceJson(value);
-    if (!isRecord2(parsed) || !isSafeId(parsed.id)) return null;
+    if (!isRecord3(parsed) || !isSafeId(parsed.id)) return null;
     if (parsed.type !== "retry" && parsed.type !== "discard-failed") return null;
     if (typeof parsed.issuedAt !== "number" || !Number.isFinite(parsed.issuedAt)) return null;
     return { id: parsed.id, type: parsed.type, issuedAt: parsed.issuedAt };
   }
   function readAudio(value) {
     if (value === null) return null;
-    if (!isRecord2(value)) return null;
+    if (!isRecord3(value)) return null;
     if (value.fileName !== "audio.m4a" || value.contentType !== "audio/mp4" || !isPositiveInteger(value.byteSize) || value.byteSize > 1024 * 1024 || !isNonNegativeInteger(value.startMs) || !isPositiveInteger(value.endMs) || !isPositiveInteger(value.durationMs) || value.endMs <= value.startMs || value.durationMs !== value.endMs - value.startMs || value.durationMs > 3e4 || typeof value.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.sha256)) return null;
     return {
       fileName: "audio.m4a",
@@ -818,7 +1054,7 @@ ${STATUS_MARKER2}`;
       sha256: value.sha256
     };
   }
-  function isRecord2(value) {
+  function isRecord3(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
   }
   function isSafeId(value) {
@@ -1124,27 +1360,27 @@ ${STATUS_MARKER2}`;
   };
   function parseApiBody(response) {
     const body = readBodyRecord(response.data, response.text);
-    const data = isRecord3(body.data) ? body.data : null;
-    const item = data && isRecord3(data.item) ? data.item : null;
-    const error = isRecord3(body.error) ? body.error : null;
+    const data = isRecord4(body.data) ? body.data : null;
+    const item = data && isRecord4(data.item) ? data.item : null;
+    const error = isRecord4(body.error) ? body.error : null;
     return {
       ...item ? { data: { item: { id: readString3(item.id) || void 0 } } } : {},
       ...error ? { error: { message: readString3(error.message) || void 0 } } : {}
     };
   }
   function readBodyRecord(data, text) {
-    if (isRecord3(data)) return data;
+    if (isRecord4(data)) return data;
     try {
       const parsed = text ? JSON.parse(text) : {};
-      return isRecord3(parsed) ? parsed : {};
+      return isRecord4(parsed) ? parsed : {};
     } catch (_error) {
       return {};
     }
   }
   function readApiErrorMessage(body) {
-    return isRecord3(body.error) ? readString3(body.error.message) : "";
+    return isRecord4(body.error) ? readString3(body.error.message) : "";
   }
-  function isRecord3(value) {
+  function isRecord4(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
   }
   function readString3(value) {

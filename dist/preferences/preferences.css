@@ -314,3 +314,12 @@ input[readonly] { color: var(--text-muted); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.001ms !important; animation-duration: 0.001ms !important; }
 }
+
+/* Synced values can change after IINA measures this page once. */
+.section[aria-labelledby="synced-title"] .row > span { flex-shrink: 0; }
+.section[aria-labelledby="synced-title"] .row strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

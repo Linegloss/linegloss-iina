@@ -1,6 +1,6 @@
 {
   "sourceRepository": "subtitles-mono",
-  "sourceCommit": "4618c0d658760b4d195de4856eb7f08ebfbe453f",
+  "sourceCommit": "ac162aa81c8c50645e2c3cccbba080b41924e39d",
   "sourceDirty": false,
-  "pluginVersion": "0.7.0"
+  "pluginVersion": "0.9.0"
 }

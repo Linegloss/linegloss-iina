@@ -1,6 +1,6 @@
 {
   "name": "Linegloss",
-  "version": "0.7.0",
+  "version": "0.9.0",
   "identifier": "com.linegloss.iina",
   "author": {
     "name": "Linegloss",
@@ -8,7 +8,7 @@
   },
   "description": "Explain the subtitle you paused on, clip its audio, and save both to your Linegloss library.",
   "ghRepo": "Linegloss/linegloss-iina",
-  "ghVersion": 1,
+  "ghVersion": 3,
   "entry": "dist/index.js",
   "globalEntry": "dist/global.js",
   "preferencesPage": "dist/preferences/preferences.html",
@@ -18,7 +18,7 @@
     "timeoutSeconds": 45,
     "pluginToken": "",
     "accountUserId": "",
-    "accountUserName": "",
+    "accountEmail": "",
     "accountStatus": "",
     "accountCheckCommand": "",
     "llmMode": "hosted",
